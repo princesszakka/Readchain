@@ -19,11 +19,18 @@
 (define-constant err-book-unavailable (err u106))
 (define-constant err-already-borrowed (err u107))
 (define-constant err-not-borrowed (err u108))
+(define-constant err-invalid-genre (err u109))
+(define-constant err-list-not-found (err u110))
+(define-constant err-already-in-list (err u111))
+(define-constant err-not-in-list (err u112))
+(define-constant err-list-full (err u113))
 
 ;; data vars
 (define-data-var next-book-id uint u1)
 (define-data-var total-books uint u0)
 (define-data-var platform-fee uint u10)
+(define-data-var next-list-id uint u1)
+(define-data-var total-reading-lists uint u0)
 
 ;; data maps
 (define-map books
@@ -36,7 +43,10 @@
     available: bool,
     rental-price: uint,
     total-borrows: uint,
-    created-at: uint
+    created-at: uint,
+    genre: (string-ascii 30),
+    popularity-score: uint,
+    recommendation-count: uint
   }
 )
 
@@ -78,14 +88,73 @@
   }
 )
 
+(define-map reading-lists
+  uint
+  {
+    owner: principal,
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    created-at: uint,
+    is-public: bool,
+    book-count: uint,
+    followers: uint
+  }
+)
+
+(define-map reading-list-books
+  {list-id: uint, book-id: uint}
+  {
+    added-at: uint,
+    position: uint,
+    notes: (string-ascii 300)
+  }
+)
+
+(define-map genre-stats
+  (string-ascii 30)
+  {
+    total-books: uint,
+    total-borrows: uint,
+    avg-rating: uint,
+    trending-score: uint
+  }
+)
+
+(define-map user-genre-preferences
+  {user: principal, genre: (string-ascii 30)}
+  {
+    books-read: uint,
+    last-activity: uint,
+    preference-score: uint
+  }
+)
+
+(define-map book-recommendations
+  {recommender: principal, book-id: uint, recommended-to: principal}
+  {
+    created-at: uint,
+    reason: (string-ascii 200),
+    accepted: bool
+  }
+)
+
+(define-map list-followers
+  {list-id: uint, follower: principal}
+  {
+    followed-at: uint,
+    notifications: bool
+  }
+)
+
 ;; public functions
-(define-public (register-book (title (string-ascii 100)) (author (string-ascii 50)) (isbn (string-ascii 20)) (rental-price uint))
+(define-public (register-book (title (string-ascii 100)) (author (string-ascii 50)) (isbn (string-ascii 20)) (rental-price uint) (genre (string-ascii 30)))
   (let
     (
       (book-id (var-get next-book-id))
       (current-block stacks-block-height)
     )
     (asserts! (> rental-price u0) err-invalid-amount)
+    (asserts! (> (len genre) u0) err-invalid-genre)
     (try! (ft-mint? read-token u100 tx-sender))
     (map-set books book-id
       {
@@ -96,11 +165,15 @@
         available: true,
         rental-price: rental-price,
         total-borrows: u0,
-        created-at: current-block
+        created-at: current-block,
+        genre: genre,
+        popularity-score: u0,
+        recommendation-count: u0
       }
     )
     (var-set next-book-id (+ book-id u1))
     (var-set total-books (+ (var-get total-books) u1))
+    (update-genre-stats genre u1 u0)
     (update-user-stats tx-sender u1 u0 u0 u5)
     (ok book-id)
   )
@@ -120,7 +193,7 @@
     (asserts! (not (is-eq tx-sender (get owner book))) err-unauthorized)
     (asserts! (is-none (map-get? book-borrowers {book-id: book-id, borrower: tx-sender})) err-already-borrowed)
     (try! (ft-transfer? read-token rental-cost tx-sender (get owner book)))
-    (map-set books book-id (merge book {available: false, total-borrows: (+ (get total-borrows book) u1)}))
+    (map-set books book-id (merge book {available: false, total-borrows: (+ (get total-borrows book) u1), popularity-score: (+ (get popularity-score book) u1)}))
     (map-set book-borrowers {book-id: book-id, borrower: tx-sender}
       {
         borrowed-at: current-block,
@@ -128,6 +201,8 @@
         returned: false
       }
     )
+    (update-genre-stats (get genre book) u0 u1)
+    (update-user-genre-preference tx-sender (get genre book))
     (update-user-stats tx-sender u0 u1 u0 u2)
     (update-user-stats (get owner book) u0 u0 owner-payment u3)
     (ok true)
@@ -226,6 +301,137 @@
   )
 )
 
+(define-public (create-reading-list (name (string-ascii 50)) (description (string-ascii 200)) (is-public bool))
+  (let
+    (
+      (list-id (var-get next-list-id))
+      (current-block stacks-block-height)
+    )
+    (asserts! (> (len name) u0) err-invalid-amount)
+    (map-set reading-lists list-id
+      {
+        owner: tx-sender,
+        name: name,
+        description: description,
+        created-at: current-block,
+        is-public: is-public,
+        book-count: u0,
+        followers: u0
+      }
+    )
+    (var-set next-list-id (+ list-id u1))
+    (var-set total-reading-lists (+ (var-get total-reading-lists) u1))
+    (try! (ft-mint? read-token u50 tx-sender))
+    (ok list-id)
+  )
+)
+
+(define-public (add-book-to-list (list-id uint) (book-id uint) (notes (string-ascii 300)))
+  (let
+    (
+      (reading-list (unwrap! (map-get? reading-lists list-id) err-list-not-found))
+      (book (unwrap! (map-get? books book-id) err-not-found))
+      (current-block stacks-block-height)
+      (current-position (get book-count reading-list))
+    )
+    (asserts! (is-eq tx-sender (get owner reading-list)) err-unauthorized)
+    (asserts! (< current-position u50) err-list-full)
+    (asserts! (is-none (map-get? reading-list-books {list-id: list-id, book-id: book-id})) err-already-in-list)
+    (map-set reading-list-books {list-id: list-id, book-id: book-id}
+      {
+        added-at: current-block,
+        position: current-position,
+        notes: notes
+      }
+    )
+    (map-set reading-lists list-id (merge reading-list {book-count: (+ current-position u1)}))
+    (try! (ft-mint? read-token u10 tx-sender))
+    (ok true)
+  )
+)
+
+(define-public (remove-book-from-list (list-id uint) (book-id uint))
+  (let
+    (
+      (reading-list (unwrap! (map-get? reading-lists list-id) err-list-not-found))
+      (list-book (unwrap! (map-get? reading-list-books {list-id: list-id, book-id: book-id}) err-not-in-list))
+    )
+    (asserts! (is-eq tx-sender (get owner reading-list)) err-unauthorized)
+    (map-delete reading-list-books {list-id: list-id, book-id: book-id})
+    (map-set reading-lists list-id (merge reading-list {book-count: (- (get book-count reading-list) u1)}))
+    (ok true)
+  )
+)
+
+(define-public (follow-reading-list (list-id uint))
+  (let
+    (
+      (reading-list (unwrap! (map-get? reading-lists list-id) err-list-not-found))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get is-public reading-list) err-unauthorized)
+    (asserts! (not (is-eq tx-sender (get owner reading-list))) err-unauthorized)
+    (asserts! (is-none (map-get? list-followers {list-id: list-id, follower: tx-sender})) err-already-exists)
+    (map-set list-followers {list-id: list-id, follower: tx-sender}
+      {
+        followed-at: current-block,
+        notifications: true
+      }
+    )
+    (map-set reading-lists list-id (merge reading-list {followers: (+ (get followers reading-list) u1)}))
+    (try! (ft-mint? read-token u25 tx-sender))
+    (ok true)
+  )
+)
+
+(define-public (unfollow-reading-list (list-id uint))
+  (let
+    (
+      (reading-list (unwrap! (map-get? reading-lists list-id) err-list-not-found))
+      (follow-info (unwrap! (map-get? list-followers {list-id: list-id, follower: tx-sender}) err-not-found))
+    )
+    (map-delete list-followers {list-id: list-id, follower: tx-sender})
+    (map-set reading-lists list-id (merge reading-list {followers: (- (get followers reading-list) u1)}))
+    (ok true)
+  )
+)
+
+(define-public (recommend-book (book-id uint) (recommended-to principal) (reason (string-ascii 200)))
+  (let
+    (
+      (book (unwrap! (map-get? books book-id) err-not-found))
+      (current-block stacks-block-height)
+    )
+    (asserts! (not (is-eq tx-sender recommended-to)) err-unauthorized)
+    (asserts! (> (len reason) u0) err-invalid-amount)
+    (map-set book-recommendations {recommender: tx-sender, book-id: book-id, recommended-to: recommended-to}
+      {
+        created-at: current-block,
+        reason: reason,
+        accepted: false
+      }
+    )
+    (map-set books book-id (merge book {recommendation-count: (+ (get recommendation-count book) u1)}))
+    (try! (ft-mint? read-token u15 tx-sender))
+    (ok true)
+  )
+)
+
+(define-public (accept-recommendation (recommender principal) (book-id uint))
+  (let
+    (
+      (recommendation (unwrap! (map-get? book-recommendations {recommender: recommender, book-id: book-id, recommended-to: tx-sender}) err-not-found))
+    )
+    (asserts! (not (get accepted recommendation)) err-already-exists)
+    (map-set book-recommendations {recommender: recommender, book-id: book-id, recommended-to: tx-sender}
+      (merge recommendation {accepted: true})
+    )
+    (try! (ft-mint? read-token u30 tx-sender))
+    (try! (ft-mint? read-token u20 recommender))
+    (ok true)
+  )
+)
+
 ;; read only functions
 (define-read-only (get-book (book-id uint))
   (map-get? books book-id)
@@ -280,6 +486,62 @@
   )
 )
 
+(define-read-only (get-reading-list (list-id uint))
+  (map-get? reading-lists list-id)
+)
+
+(define-read-only (get-reading-list-book (list-id uint) (book-id uint))
+  (map-get? reading-list-books {list-id: list-id, book-id: book-id})
+)
+
+(define-read-only (get-genre-stats (genre (string-ascii 30)))
+  (default-to
+    {total-books: u0, total-borrows: u0, avg-rating: u0, trending-score: u0}
+    (map-get? genre-stats genre)
+  )
+)
+
+(define-read-only (get-user-genre-preference (user principal) (genre (string-ascii 30)))
+  (default-to
+    {books-read: u0, last-activity: u0, preference-score: u0}
+    (map-get? user-genre-preferences {user: user, genre: genre})
+  )
+)
+
+(define-read-only (get-book-recommendation (recommender principal) (book-id uint) (recommended-to principal))
+  (map-get? book-recommendations {recommender: recommender, book-id: book-id, recommended-to: recommended-to})
+)
+
+(define-read-only (get-list-follower-info (list-id uint) (follower principal))
+  (map-get? list-followers {list-id: list-id, follower: follower})
+)
+
+(define-read-only (get-total-reading-lists)
+  (var-get total-reading-lists)
+)
+
+(define-read-only (get-next-list-id)
+  (var-get next-list-id)
+)
+
+(define-read-only (is-following-list (list-id uint) (user principal))
+  (is-some (map-get? list-followers {list-id: list-id, follower: user}))
+)
+
+(define-read-only (get-book-popularity (book-id uint))
+  (match (map-get? books book-id)
+    book (get popularity-score book)
+    u0
+  )
+)
+
+(define-read-only (get-book-recommendations-count (book-id uint))
+  (match (map-get? books book-id)
+    book (get recommendation-count book)
+    u0
+  )
+)
+
 ;; private functions
 (define-private (update-user-stats (user principal) (books-owned-delta uint) (books-borrowed-delta uint) (earned-delta uint) (reputation-delta uint))
   (let
@@ -292,6 +554,43 @@
         books-borrowed: (+ (get books-borrowed current-stats) books-borrowed-delta),
         total-earned: (+ (get total-earned current-stats) earned-delta),
         reputation-score: (+ (get reputation-score current-stats) reputation-delta)
+      }
+    )
+  )
+)
+
+(define-private (update-genre-stats (genre (string-ascii 30)) (books-delta uint) (borrows-delta uint))
+  (let
+    (
+      (current-stats (default-to {total-books: u0, total-borrows: u0, avg-rating: u0, trending-score: u0} (map-get? genre-stats genre)))
+      (new-total-books (+ (get total-books current-stats) books-delta))
+      (new-total-borrows (+ (get total-borrows current-stats) borrows-delta))
+      (trending-score (+ (* new-total-borrows u2) new-total-books))
+    )
+    (map-set genre-stats genre
+      {
+        total-books: new-total-books,
+        total-borrows: new-total-borrows,
+        avg-rating: (get avg-rating current-stats),
+        trending-score: trending-score
+      }
+    )
+  )
+)
+
+(define-private (update-user-genre-preference (user principal) (genre (string-ascii 30)))
+  (let
+    (
+      (current-pref (default-to {books-read: u0, last-activity: u0, preference-score: u0} (map-get? user-genre-preferences {user: user, genre: genre})))
+      (current-block stacks-block-height)
+      (new-books-read (+ (get books-read current-pref) u1))
+      (new-preference-score (+ (get preference-score current-pref) u10))
+    )
+    (map-set user-genre-preferences {user: user, genre: genre}
+      {
+        books-read: new-books-read,
+        last-activity: current-block,
+        preference-score: new-preference-score
       }
     )
   )
